@@ -100,9 +100,19 @@ Mapped to the three tools the POC must eventually subsume:
 - Test modules observed: `test_boost/ combmode/ coolant/ dpf/ egr/ fuel_pressure/ fueling/ idle_quality/ maf/ o2_nox_sensor/ oil_catalyst/ scr/ spec_range/ torque_response/ torque_validation.py`.
 - Emit the KPIs the team relies on: **violation distributions, pass rates, fail rates, FOM (figure of merit)**, run counts, distinct files, durations — sliceable by project / module / test / device class / software revision.
 
-### 5.3 Aggregate reporting (SPOT-equivalent)
-- Reproduce SPOT report primitives against persisted tables: **scatter, 1D histogram, 2D histogram (heatmap), and filtering**, with **multi-file / multi-trip aggregation**.
-- Support binning over engine operating axes (e.g. RPM × `VeMAFR_m_AirPerCylCurEst_Trpd`) with per-cell aggregate stats (avg / min / max / std / frequency), as seen in the SPOT 2D-hist plots.
+### 5.3 Aggregate reporting (SPOT-equivalent) — **a POC focus**
+SPOT is a Python script that renders a Plotly HTML report; its plots are configured in the `SPOT_INPUT` workbook's **Template Plots** tab, where **1 row = 1 plot**. Reference output: `LS6_July_HOT_OTR-plots.html` = **76 plots** (45 2D Histogram, 28 Scatter Plot, 3 1D Histogram).
+
+Each Template Plots row defines:
+- **Plot Type** (`2D Histogram` / `Scatter Plot` / `1D Histogram`).
+- **Analyzed signal** (Z / color value, or the 1D-binned signal) — often a custom signal (`V8_CA50_EA`, `CA50_ANNmnsMeas`).
+- **X / Y channels** (typically RPM `VeEPSI_n_LoresI` × air `VeMAFR_m_AirPerCylCurEst_Trpd`), **Z min/max**, **X/Y bin break points**.
+- **Plot Stat Type** — `Min` / `Max` / `Mean` — the per-cell statistic.
+- **Filter 1–5** (`Variable | Equal/Not Equal/Min/Max | value`, **AND-combined**) + a **Delta Threshold Filter**; colormap and units.
+
+Requirements: reproduce these plot primitives against persisted tables with **multi-file / multi-trip aggregation** and the same binning + filters.
+
+> **Note (partial fit):** the SPOT **2D histogram** colors each RPM×Air cell by the **Mean/Min/Max of the third signal Z**. Impulse's native `Histogram2D` is occupancy/weight-based, so per-cell Z-statistics need a small extension or ad-hoc implementation — see the proposal §4.2. The 1D-histogram, scatter, and filtering primitives map directly.
 
 ### 5.4 "Macroscope → microscope" drill-down
 - High-level KPI view first, then drill into a specific trip → time window → raw signal traces (the INCA/MDA manual step). This drill-down must be at least as fast/easy as current tooling.

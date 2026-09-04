@@ -27,7 +27,7 @@ The ADCAP team's need decomposes into: *stop reprocessing raw files*, *persist c
 | **Queryable, persistent results ("island" → centralized)** | **Gold layer in Unity Catalog** | Fact tables (`event_instance_fact`, `histogram_fact`, `histogram2d_fact`, `stats_aggregator_fact`) + dimensions are ordinary UC Delta tables — joinable to *any* other GM data (e.g. manufacturing) and queryable without touching raw files. |
 | **ADCAP "Tests" / KPIs — Concern & Failure thresholds, violations** | **Events** (`BasicEvent`, `SequenceOfEvents`, `PointsInTimeEvent`, `ContainerEvent`) | A test's boolean condition (e.g. `VeSCRD_r_EffDiffRGN_SCR2 < 0.45`) becomes a `BasicEvent`; each interval where it's true is a violation instance in `event_instance_fact`. Concern vs. Failure = two events/thresholds. Pass/fail/violation-rate KPIs come from aggregating those instances. |
 | **"Did X happen one loop before Y" — cross-ECU sequencing** | `SequenceOfEvents` + narrow per-sample silver model | The query engine aligns channels recorded at different loop rates on their real timestamps; `SequenceOfEvents` captures ordered state transitions. Timing is preserved (see below). |
-| **SPOT reports: scatter, 1D/2D histograms, filtering, multi-file** | **Aggregations** run in parallel across all matching recordings | `HistogramDuration`/`HistogramDistance`, `Histogram2D` (duration/distance/custom-weighted), `StatsAggregator`, `PointValueAggregator`. A SPOT 2D-hist over RPM × `VeMAFR_m_AirPerCylCurEst_Trpd` with per-cell avg/min/max/std is a `Histogram2D`; event-scoping = SPOT's filters. |
+| **SPOT reports: 2D-hist, scatter, 1D-hist, filtering, multi-file** | **Aggregations** + **events** run in parallel across all matching recordings | 1D-hist → `HistogramDuration`/`HistogramDistance`; scatter → synchronized channel samples (ad-hoc / `PointValueAggregator`); SPOT's Filter 1–5 (AND-combined) → a `BasicEvent` boolean scoping the aggregation. **Caveat on 2D-hist — see §4.1:** SPOT colors each RPM×Air cell by the *Mean/Min/Max of a third signal Z*; Impulse's native `Histogram2D` is occupancy/weight-based (duration/distance/custom-weight), so per-cell mean-of-Z needs a small extension (custom-weights ratio for a weighted mean, or a binned-statistic aggregation) — **the one place the fit is partial, not 1:1.** |
 | **Custom Signals (SPOT algebraic derived signals)** | **TSAL virtual signals** + **CalculatedChannel** | `Coolant_dT = VeEECR_T_EngArbitrated − VeEECR_T_EngInletCoolant` is a one-line TSAL expression; `CalculatedChannel` materializes it as a new persisted channel (same per-sample grain) so it's reusable and queryable. NumPy-style math is supported. |
 | **Exact timing preserved for (co-)simulation** | **Silver per-sample model + RLE data type** | The narrow `(container, channel, tstart, tend, value)` grain keeps original sample timing; downsampling is opt-in per aggregation, not forced on ingestion. |
 | **Software-build correlation** | **Container/channel tags + dimensions** | Software/build revision rides as a container tag; every event/aggregation is sliceable by it in the gold dimensions — matching ADCAP's build-vs-pass/fail trend view. |
@@ -37,13 +37,18 @@ The ADCAP team's need decomposes into: *stop reprocessing raw files*, *persist c
 | **Keep GM's existing Python** | **Pure library, no CLI/bundle** | Impulse runs inside notebooks/jobs; GM scripts re-point from raw MF4 to the UC tables. Ad-hoc mode hands back DataFrames, so existing analysis code keeps working. |
 | **Agent-authored tests (today an agent auto-generates test scripts)** | **Agent Skills** in [`skills/`](../skills/) | The skill set teaches Genie Code / Claude / any Agent-Skills tool to author TSAL events & aggregations — a path to auto-generating Impulse "tests" from natural language, as ADCAP does today. |
 
-**Net:** the mapping is close to 1:1. Impulse is not a generic tool being bent to fit; it is the same problem shape (automotive calibration time-series at scale) with the persistence + incremental model ADCAP is explicitly asking for.
+**Net:** the mapping is close to 1:1, with one partial (the SPOT 2D-hist per-cell Z-statistic — §4.1). Impulse is not a generic tool being bent to fit; it is the same problem shape (automotive calibration time-series at scale) with the persistence + incremental model ADCAP is explicitly asking for.
 
 ---
 
 ## 2. Scope of this POC
 
-Consistent with the decisions already reached (focused POC, not a full migration or ADCAP re-build):
+Consistent with the decisions already reached (focused POC, not a full migration or ADCAP re-build). Of GM's **three** MF4 analysis methods, the POC targets **two**:
+
+1. **SPOT reports** — the batch report generator whose plots are configured in the `SPOT_INPUT` workbook's **Template Plots** tab (see §4.2).
+2. **Time Series Analysis** — the GM KPI/Python "tests" in `GM-SDV/etc-time-series-tests`.
+
+**Manual analysis in ETAS INCA / MDA is explicitly out of scope** — it is interactive, human-in-the-loop trace inspection; Impulse's ad-hoc mode can *support* that style of drill-down later, but reproducing INCA is not a POC goal.
 
 **In scope — the analytics layer, post-ingestion:**
 - Start from **bronze** (MF4 already ingested by data engineering) for **one vehicle program** (candidate: a program already fully in bronze, e.g. an `LS6` / `T1XX_HDPU_DK68`-class project — final pick with GM).
@@ -67,8 +72,8 @@ Consistent with the decisions already reached (focused POC, not a full migration
 **Phase 3 — Reproduce GM business logic.**
 - Translate SPOT **Custom Signals** → TSAL / `CalculatedChannel`.
 - Translate a subset of **Python tests** → Impulse **events** (Concern/Failure thresholds) with pass/fail/violation KPIs via `StatsAggregator`.
-- Reproduce SPOT **2D-hist / scatter** reports as `Histogram2D` / aggregations.
-- **Validate parity**: KPI values and pass/fail/violation counts match the ADCAP tool for the same files/builds.
+- Reproduce SPOT reports from the **Template Plots** rows: 1D-hist and scatter directly; **2D-hist via the binned-statistic approach in §4.2** (prove one Mean plot end-to-end, e.g. `IAT` / `FinalAdv`).
+- **Validate parity**: KPI values, pass/fail/violation counts, and 2D-hist cell values match the ADCAP tool / the `LS6_July_HOT_OTR-plots.html` output for the same files/builds.
 
 **Phase 4 — Surface it.** Publish an AI/BI Dashboard (or Lakehouse App) over the gold tables (macroscope), and demonstrate a notebook **ad-hoc** drill-down (microscope). Time both against current tooling to answer the "is it actually faster?" question.
 
@@ -105,7 +110,32 @@ flowchart LR
 - **Ad-hoc** — TSAL evaluated live to a DataFrame, no writes. *(Replaces laptop-local Python + INCA/MDA microscope work.)*
 - **ML** — event-scoped stats/histograms as a feature matrix. *(Future MSG / co-simulation.)*
 
-**Key design decision — bronze→silver: reshape vs. adapt.** Impulse reads a silver model of `containers`/`channels`/`tags`/`metrics`. Two options, to decide with GM data engineering early:
+### 4.1 The SPOT report model (Template Plots)
+
+SPOT is a Python script that renders one Plotly HTML report from a spreadsheet config; the driving tab is **Template Plots**, where **1 row = 1 plot**. Reference output for the POC program: `LS6_July_HOT_OTR-plots.html` — **76 plots** (45 **2D Histogram**, 28 **Scatter Plot**, 3 **1D Histogram**). Each row specifies:
+
+- **Plot Type** — `2D Histogram` / `Scatter Plot` / `1D Histogram`.
+- **Channel Name** — the analyzed signal (the Z / color value for 2D-hist & scatter, or the binned signal for 1D-hist), e.g. `VeEITI_T_InductionAir`, `V8_CA50_EA`.
+- **X-Axis / Y-Axis channels** — almost always RPM (`VeEPSI_n_LoresI`) × air-per-cylinder (`VeMAFR_m_AirPerCylCurEst_Trpd`).
+- **Z Min / Z Max** — color-scale bounds; **Cal X / Cal Y break points** — the bin edges (or a bin count).
+- **Plot Stat Type** — `Min` / `Max` / **`Mean`** — the statistic shown per cell.
+- **Filter 1–5** — `Variable | Type (Equal / Not Equal / Min / Max) | value` — **AND-combined** (e.g. `VeFULR_Cnt_NumOfCylsBeingFueled == 8` AND `VeTCOC_b_DFCO_Enabled != 1` AND `VeSPRK_phi_TotalTrqRequests == 0`), plus a **Delta Threshold Filter**.
+- Presentation: colormap (Palettes tab), units, guidelines.
+
+Impulse mapping: each row → a `Page` aggregation; **Filters 1–5** → a `BasicEvent` boolean scoping it; **Custom-signal** channels (`V8_CA50_EA`, `CA50_ANNmnsMeas`, …) → `CalculatedChannel`. The whole tab becomes a small config-driven generator that emits Impulse aggregations — a natural POC deliverable.
+
+### 4.2 Known gap — SPOT 2D-histogram is a *binned statistic of a Z-signal*
+
+SPOT's 2D-histogram bins by (X=RPM, Y=Air) and colors each cell with the **Mean/Min/Max of a third signal Z** in that cell. Impulse's native `Histogram2D` (`Duration` / `Distance` / `CustomWeights`) instead accumulates a **weight** per cell — occupancy, not a statistic of a separate Z. So this specific plot is **not** a drop-in `Histogram2D`. Options to close it, in order of fidelity/effort:
+
+1. **Duration-weighted mean via two custom-weights passes** — one `Histogram2DCustomWeights` weighted by `Z` (with `weight_type="time"` → Σ Z·dt), one by duration (Σ dt), divided cell-wise. Gives a *duration-weighted* mean; confirm with GM whether SPOT's "Mean" is sample- or time-weighted. **Does not cover Min/Max per cell.**
+2. **A small binned-statistic-2D extension / ad-hoc implementation** — pull synchronized X/Y/Z `SampleSeries` from the query engine and apply a per-cell `mean/min/max` (e.g. `scipy.stats.binned_statistic_2d`). Most faithful; a clean candidate to contribute back to Impulse. Best done in **ad-hoc mode** first, then productionized.
+
+This is the **one area where the fit is partial** and should be an early, explicit POC task — not discovered late.
+
+### 4.3 Key design decision — bronze→silver: reshape vs. adapt
+
+Impulse reads a silver model of `containers`/`channels`/`tags`/`metrics`. Two options, to decide with GM data engineering early:
 1. **Reshape** the program's bronze into Impulse's standard silver tables (cleanest; leverages the standard pipeline directly).
 2. **Adapt** Impulse to GM's *existing* silver layout via config **column mappings** and/or a pluggable **solver** (the query engine is explicitly designed to "adapt to any silver-layer layout via interchangeable solvers") — lighter touch on GM's data model.
 
@@ -124,6 +154,7 @@ This decision also intersects the **open table-ownership / schema-evolution ques
 
 ## 6. Risks & open questions (carried from requirements §8)
 
+- **SPOT 2D-hist per-cell Z-statistic (§4.2)** — the one partial fit; needs a small extension or ad-hoc implementation for Mean, and more work for Min/Max. Confirm SPOT's exact "Mean" semantics (sample vs. time-weighted) with GM.
 - **Table ownership & schema evolution** — needs its own session; blocks a clean answer on where calculated-channel/KPI tables live and who evolves them.
 - **Is ad-hoc genuinely faster in Databricks?** — explicitly validated in Phase 4, not assumed.
 - **Bronze layout & fidelity** — depends on how much metadata data-engineering parsed from MF4; labeling gaps may surface (requirements §4.2).
