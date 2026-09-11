@@ -43,7 +43,15 @@
 
 ## 3. The Impulse Silver Input Contract (the "table format")
 
-Impulse's `DefaultSolver` reads **three required tables** plus optional add-ons. GM (with Databricks) must produce these from bronze. Column **types and key columns below are fixed by the engine's internal names**; other metric columns are flexible. Where GM's existing columns differ in name, we remap them via `solver_config.column_name_mapping` instead of renaming source data (see §5).
+Impulse's `DefaultSolver` reads **only three required tables** plus optional add-ons:
+
+- **`channels`** — the **large** time-series sample data (the only big table).
+- **`container_metrics`** — small metadata table, one row per container (a container = one test drive / bench run).
+- **`channel_metrics`** — small metadata table, one row per channel (a channel = a sensor signal, e.g. Engine Speed).
+
+The two `*_metrics` tables are tiny metadata; effectively all volume lives in `channels`. GM (with Databricks) produces these from bronze. Column **types and key columns below are fixed by the engine's internal names**; other metric columns are flexible. Where GM's existing columns differ in name, we remap them via `solver_config.column_name_mapping` rather than renaming source data (see §5). **Note:** we may not have to build these tables at all — see §5 on connecting Impulse directly to GM's bronze via a custom solver.
+
+> **`container_id` type:** the reference schema uses `long`, but per the [Impulse ingestion docs](https://databrickslabs.github.io/impulse/docs/data_model/ingestion/) the engine accepts `long`, `int`, **or `string`** — as long as the type is **consistent across every table** (it is the PK on `container_metrics` and the FK everywhere else). `(container_id, channel_id)` identifies a channel and `channel_id` is **local to its container**.
 
 ### 3.1 `container_metrics` — **required** (one row per recording / trip)
 
@@ -99,6 +107,9 @@ Two supported formats — pick one and set `query_engine.data_type` to match:
 | `value` | double | Yes | |
 | `is_plausible` | boolean | No | Optional; enables `drop_implausible_data` (RAW only). |
 
+> **RAW encoder:** in RAW mode the engine converts point samples to intervals via `query_engine.raw_encoder` — `"RLE"` (default, collapses equal-valued runs) or `"INTERVAL"` (keeps every sample, only derives `tend` and drops exact duplicates). Choose `"INTERVAL"` when exact per-sample timing must be preserved for (co-)simulation.
+> **MF4 invalidation bits → `is_plausible`:** the Impulse ingestion docs call out that MDF4/ASAM per-sample **invalidation bits** must be honored — drop or mark invalid samples **before** RLE encoding, or carry them into the `is_plausible` column (RAW) so `drop_implausible_data=True` can exclude them. GM/data-engineering should confirm how invalidation bits are represented in the current bronze so we preserve this.
+
 > **Time base:** `tstart`/`tend`/`timestamp` are integer time. Use **one consistent base across all tables**; **epoch microseconds** is recommended (it matches the POI schema). This is where **cross-ECU time alignment** must be correct — signals at different loop rates must share the same time base so sequencing ("did X happen one loop before Y") is faithful. Extra bookkeeping columns on `channels` are ignored by the engine, so they're safe to keep.
 > `channels` is by far the largest table — plan to `OPTIMIZE` / Z-order on `(container_id, channel_id)`.
 
@@ -150,14 +161,32 @@ From the current tooling, GM should provide:
 
 ---
 
-## 5. Format Compliance — Reshape vs. Adapt (decide with data engineering)
+## 5. How GM's Data Connects to Impulse — Bronze-direct vs. Silver (decide with data engineering)
 
-GM's bronze almost certainly does **not** already match §3 column-for-column. Two compliant paths — pick per table:
+Ingestion is owned by data engineering and MF4 is **already in Databricks**. So the first analytics-layer decision is *how Impulse reads that data*. The Impulse [ingestion / "Adapting to existing data layouts"](https://databrickslabs.github.io/impulse/docs/data_model/ingestion/#adapting-to-existing-data-layouts) guidance gives the rule: *"SolverConfig for naming differences, custom solver for structural differences, ETL into the standard shape for everything else."*
 
-1. **Reshape at silver** *(recommended, cleanest)* — an ETL step turns bronze into the exact §3 tables. Uses the standard Impulse pipeline directly.
-2. **Adapt via config** *(lighter touch)* — keep GM's existing Delta layout and declare `query_engine.solver_config.column_name_mapping` per table (physical → internal names like `container_id`, `tstart`, `tend`, `value`, `key`). The relationships must still hold (per-`(container_id, channel_id)` channel rows, EAV tag tables). For structurally different layouts (no EAV, composite keys), a custom solver is possible but is a larger investment — a one-time ETL is usually cheaper.
+### 5.1 Preferred direction — connect Impulse **directly to GM's narrow bronze** (evaluate first)
 
-**GM deliverable for this decision:** the **schema of the current bronze/silver tables** (column names, types, keys, how signals and metadata are represented) so we can produce the mapping or the reshape ETL.
+From the screenshots, GM appears to **pivot bronze → a wide silver table**. Impulse can instead read GM's existing layout via a **custom solver**, so **the pivot may be unnecessary**. This is the recommended option to evaluate first, and it has real advantages:
+
+- **No pivot step** — saves the compute/storage cost of building and maintaining a wide silver table.
+- **Full channel coverage** — Impulse sees **all** channels in bronze, not just the subset that made it into a pivoted table (pivoted/wide tables almost always carry a limited signal set).
+- Impulse's `channels` model is intentionally **narrow** (`container_id, channel_id, tstart/tend/timestamp, value`), which is the natural shape of un-pivoted bronze samples.
+
+**Precedent & support:** Databricks did exactly this at **Stellantis** — a **custom `QuerySolver`** over the customer's existing layout — and the Impulse team has offered to **help build the equivalent solver for GM**. A **second native single-input-table solver** (one table only) is also on the Impulse roadmap, which may make bronze-direct even simpler.
+
+### 5.2 Fallback paths (if bronze can't be read directly)
+
+- **Reshape — ETL into the standard shape.** One-shot ETL `SELECT` from bronze → the §3 silver tables; wide metadata **unpivoted into `(container_id, key, value)`** tags. Cleanest when a custom solver isn't warranted.
+- **Adapt via `SolverConfig`.** Keep GM's layout; declare per-table `column_name_mapping` (physical → internal names `container_id`, `channel_id`, `tstart`, `tend`, `value`, `key`), plus optional per-table `filters` and a top-level `project_id`. Naming differences only — the silver relationships must still hold.
+- **Custom solver.** For structurally different layouts (no EAV, composite keys, JSON-encoded values). Subclass `QuerySolver` and implement `filter_container_tags/…_metrics/…_channel_tags/…_channel_metrics` and `solve()`. *(This is also the mechanism used in 5.1 to read bronze directly.)*
+
+### 5.3 What GM needs to provide to make this call (data discovery)
+
+- [ ] **Example data of the existing bronze layer** (schema + a small sample) — column names, types, keys, and how signals are represented (narrow samples vs. something else).
+- [ ] **Example data of the pivoted silver/wide table**, if they keep one — and specifically **how many columns** it has.
+- [ ] **What additional metadata is available** and where it lives: **ECU software/build versions, track/route info, fleet metadata, vehicle metadata**, trip info, project. (These become container tags / metrics and drive the build-vs-pass/fail correlation.)
+- [ ] **Is connecting Impulse directly to bronze an option?** (governance/access on the bronze tables, and whether data engineering is comfortable with read access.)
 
 ---
 
@@ -180,10 +209,13 @@ GM's bronze almost certainly does **not** already match §3 column-for-column. T
 **Data**
 - [ ] POC program chosen + confirmed in bronze; project identifier provided
 - [ ] UC location of bronze data + read access
-- [ ] Current bronze/silver schema documented (for reshape/mapping decision)
+- [ ] **Example data + schema of the bronze layer** (narrow) — for the connection-path decision
+- [ ] **Example data of the pivoted/wide silver table (if any) + its column count**
+- [ ] **Additional metadata inventory**: ECU software/build versions, track/route, fleet, vehicle, trip, project
+- [ ] Decision: **connect Impulse directly to bronze** (custom solver, Stellantis-style — Impulse team to help) vs. reshape/adapt
 
-**Impulse silver input** (produced jointly from bronze)
-- [ ] `container_metrics`, `channel_metrics`, `channels` (RLE or RAW) in the §3 shape
+**Impulse input** (only if we don't read bronze directly — §5.2)
+- [ ] `container_metrics`, `channel_metrics` (tiny metadata) + `channels` (large; RLE or RAW) in the §3 shape
 - [ ] `container_tags` (build/vehicle/trip/project) and `channel_tags` (`channel_name`)
 - [ ] Consistent integer time base (epoch µs) with cross-ECU alignment verified
 - [ ] `channel_mapping`/`unit_conversion` if aliases/units are in play

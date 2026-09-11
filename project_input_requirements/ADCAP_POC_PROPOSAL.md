@@ -63,11 +63,11 @@ Consistent with the decisions already reached (focused POC, not a full migration
 
 ## 3. High-level approach (phased)
 
-**Phase 0 — Enablement & access (prerequisite).** GitHub contributor access to `GM-SDV/etc-time-series-tests`; Databricks catalog/schema/workspace permissions; confirm which project is in bronze and its layout. *(See requirements doc §9.)*
+**Phase 0 — Enablement, access & data discovery (prerequisite).** GitHub contributor access to `GM-SDV/etc-time-series-tests`; Databricks catalog/schema/workspace permissions; confirm which project is in bronze. **Get example data + schema of the bronze layer and the pivoted silver (column count), and the extra-metadata inventory** (ECU build, track, fleet, vehicle) so we can choose the connection path. *(See GM handoff doc §5.3 and requirements §9.)*
 
-**Phase 1 — Land in silver.** Map the bronze representation of one program into Impulse's silver tables (`container_metrics`, `channel_metrics`, `channels`, `channel_tags`). Decide reshape-vs-adapt (§4). Carry software-build revision and trip/vehicle/project as tags. Verify time alignment across ECU loop rates on a known trip.
+**Phase 1 — Connect Impulse to the data.** **Preferred: build a custom solver over GM's narrow bronze** (Stellantis-style, with Impulse-team help) so no pivot is needed and all channels are visible; fall back to reshape/adapt into the silver tables (`channels` + tiny `container_metrics`/`channel_metrics`, plus tags) only if bronze can't be read directly (§4.3). Carry software-build revision and trip/vehicle/project as tags. Verify time alignment across ECU loop rates on a known trip.
 
-**Phase 2 — Baseline Impulse pipeline.** Configure `ImpulseConfig` (source tables, unity sink, solver). Run reporting mode with a couple of `ContainerEvent`-scoped histograms to prove bronze→silver→gold end-to-end and populate the star schema.
+**Phase 2 — Baseline Impulse pipeline.** Configure `ImpulseConfig` (source, unity sink, solver). Run reporting mode with a couple of `ContainerEvent`-scoped histograms to prove data→Impulse→gold end-to-end and populate the star schema.
 
 **Phase 3 — Reproduce GM business logic.**
 - Translate SPOT **Custom Signals** → TSAL / `CalculatedChannel`.
@@ -92,8 +92,9 @@ flowchart LR
     end
 
     subgraph ADCAP["ADCAP analytics layer (POC scope)"]
-        BRZ --> SLV["Silver — Impulse data model<br/>containers · channels · channel_tags · *_metrics<br/>(per-sample timing preserved)"]
-        SLV --> IMP["Impulse<br/>TSAL DSL · Query Engine (solvers) · Aggregations"]
+        BRZ -->|"PREFERRED: custom solver<br/>(no pivot, all channels)"| IMP["Impulse<br/>TSAL DSL · Query Engine (solvers) · Aggregations"]
+        BRZ -.->|"fallback: reshape / adapt"| SLV["Silver — Impulse data model<br/>channels + tiny container_metrics / channel_metrics<br/>(per-sample timing preserved)"]
+        SLV -.-> IMP
         IMP --> GOLD["Gold — star schema (Unity Catalog)<br/>event_instance_fact · histogram_fact ·<br/>histogram2d_fact · stats_aggregator_fact + dims"]
     end
 
@@ -133,19 +134,20 @@ SPOT's 2D-histogram bins by (X=RPM, Y=Air) and colors each cell with the **Mean/
 
 This is the **one area where the fit is partial** and should be an early, explicit POC task — not discovered late.
 
-### 4.3 Key design decision — bronze→silver: reshape vs. adapt
+### 4.3 Key design decision — how Impulse reads GM's data (bronze-direct preferred)
 
-Impulse reads a silver model of `containers`/`channels`/`tags`/`metrics`. Two options, to decide with GM data engineering early:
-1. **Reshape** the program's bronze into Impulse's standard silver tables (cleanest; leverages the standard pipeline directly).
-2. **Adapt** Impulse to GM's *existing* silver layout via config **column mappings** and/or a pluggable **solver** (the query engine is explicitly designed to "adapt to any silver-layer layout via interchangeable solvers") — lighter touch on GM's data model.
+Impulse needs only three inputs — **`channels`** (large) plus the tiny **`container_metrics`** / **`channel_metrics`** — and it can read them either from a purpose-built silver layer or, via a custom solver, **directly from GM's existing data**. GM currently appears to **pivot bronze into a wide silver table**; the **preferred direction is to skip that pivot and connect Impulse straight to the narrow bronze** (full detail + GM data-discovery asks in the [GM handoff doc §5](./GM_TO_DATABRICKS_REQUIREMENTS.md)):
 
-This decision also intersects the **open table-ownership / schema-evolution question** (requirements §8.1): calculated channels and new KPIs materialize as new columns/tables, so who owns and can evolve the silver/gold tables should be settled alongside it.
+- **Bronze-direct via a custom solver** *(preferred — evaluate first)*. Advantages: **no pivot cost**, and Impulse sees **all** channels rather than the subset a pivoted table carries. Precedent: Databricks built exactly this at **Stellantis** (a custom `QuerySolver`) and the Impulse team has offered to help build GM's. A **native single-input-table solver** is also on the Impulse roadmap.
+- **Fallbacks** — **reshape** bronze into the standard silver tables (wide metadata unpivoted into EAV tags), or **adapt via `SolverConfig`** column-name mappings when the layout is close. Per the ingestion docs: *"SolverConfig for naming differences, custom solver for structural differences, ETL into the standard shape for everything else."*
+
+Open data-discovery questions gating this call: how many columns the pivoted silver has, what extra metadata exists (ECU software/build versions, track, fleet, vehicle), example bronze + silver data, and whether direct bronze access is governance-permissible. This also intersects the **table-ownership / schema-evolution question** (requirements §8.1).
 
 ---
 
 ## 5. What the POC proves (success criteria)
 
-1. One program flows bronze → silver → Impulse → gold, with cross-ECU timing verified.
+1. One program flows from GM's data (ideally bronze-direct via a custom solver, else reshaped silver) → Impulse → gold, with cross-ECU timing verified.
 2. A subset of GM tests/KPIs and SPOT aggregates reproduced in Impulse, **matching** ADCAP tool results for the same files/builds.
 3. KPIs are **queryable from gold without reprocessing raw data**, and joinable to other UC data.
 4. Macroscope→microscope demonstrated (dashboard/Genie → notebook drill-down) and **measured** against current tooling.
@@ -164,6 +166,7 @@ This decision also intersects the **open table-ownership / schema-evolution ques
 ## 7. Immediate next steps
 
 1. Confirm access (GitHub repo + Databricks catalog/workspace) — Phase 0.
-2. Pick the POC program and inspect its bronze layout; decide reshape-vs-adapt.
-3. Select the 3–5 tests/KPIs + SPOT plots to reproduce for parity.
-4. Stand up the enablement notebook (install Impulse, wire `ImpulseConfig` to the chosen source) and run the Phase 2 baseline.
+2. Get example bronze + pivoted-silver data (and its column count) and the extra-metadata inventory; decide **bronze-direct (custom solver) vs. reshape/adapt** — with Impulse-team help (Stellantis precedent).
+3. Pick the POC program.
+4. Select the 3–5 tests/KPIs + SPOT Template-Plots rows to reproduce for parity.
+5. Stand up the enablement notebook (install Impulse, wire `ImpulseConfig` / solver to the chosen source) and run the Phase 2 baseline.
