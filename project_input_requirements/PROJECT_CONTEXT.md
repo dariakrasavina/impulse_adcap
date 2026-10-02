@@ -1,8 +1,10 @@
 # ADCAP → Impulse POC — Project Context & Data Model (Source of Truth)
 
-**Last updated:** 2026-10-01
+**Last updated:** 2026-10-02
 **Distilled from:** six meeting notes (2026-08-28 → 2026-09-25) in `../meeting notes/`.
-**Read this first.** Where this doc and the earlier `ADCAP_POC_PROPOSAL.md` / `ADCAP_POC_REQUIREMENTS.md` / `GM_TO_DATABRICKS_REQUIREMENTS.md` disagree, **this doc wins** — those predate the data-engineering alignment and data-modeling sessions (see §10 "Supersedes").
+**Read this first.** This doc **+ [`DATA_AND_BUILD_FINDINGS.md`](./DATA_AND_BUILD_FINDINGS.md)** (verified read-only from GM's workspace) are the source of truth; where they and `ADCAP_POC_PROPOSAL.md` / `GM_TO_DATABRICKS_REQUIREMENTS.md` disagree, the context/findings docs win (§10 "Supersedes").
+
+**A working Impulse build already exists** in `design_development_test.silver_plus_adcap_impulse_poc` (bronze→Silver Plus→gold on the 10-file set; Phase 1 effectively done). Details, modeling choices, and the 3 remaining gaps: `DATA_AND_BUILD_FINDINGS.md` §4.
 
 ---
 
@@ -28,8 +30,8 @@ After evaluating two options, the team **decided**:
 - **Test = Container** — **one MF4 file** (identified by file name); one discrete run of the engine/vehicle on a test bench or in the field (e.g. one dyno session or one drive cycle). This is what **`container_id`** refers to and what Impulse queries events/stats against. A single test records **5,000–10,000+ channels across ~20 calibration domains**, all sharing the same time range.
 - **Channel** — one sensor/signal within a test (e.g. coolant temp, RPM, engine load, valve-timing), its own `(timestamp, value)` time series. The narrow/EAV grain is `container_id + channel_id + timestamp + value`. (Brien's example: one channel in one test = **503 samples**.)
 - Bronze stores **timestamps and values as embedded arrays per channel/row** → must be **exploded** to one-row-per-sample before the silver transform.
-- The **`group` field = sample rate** (per the Sep 25 session): each group = a distinct sample rate within a file (e.g. 1 Hz vs 5 Hz). A physical sensor won't switch groups mid-file; a different rate → a different file (container). The same logical signal *can* appear in multiple groups when measured independently by multiple ECU cores at the same nominal rate with a slight phase offset — a known MF4 corner case to revisit with Thomas Bonford on real data.
-- **Values are not all numeric:** some signals are **enum/text with a numeric code**, and GM wants the **actual string preserved** (no lossy double conversion). **Recommended pattern (per the Impulse EU team — see [`IMPULSE_SCALING_AND_DESIGN.md`](./IMPULSE_SCALING_AND_DESIGN.md) §6):** not a single string column, but **multiple typed value columns on `channels`** — `raw_value` (int), `scaled_value` (double), `string_value` (string) — plus a **`value_map`** selector saying which column holds each datapoint (`value_map` also on `channel_metrics` to set a channel's value type). Confirm the concrete columns with Thomas Bonford against GM's real bronze.
+- The **`group` field = sample-rate raster — CONFIRMED from workspace data** (`DATA_AND_BUILD_FINDINGS.md` §2): per-group rates cluster on clean values (1–1000 Hz), all channels in a group share one time axis. **Multiple groups can share a nominal rate**, and the **same channel does appear in >1 group** ⇒ **channel identity = `(channelName, group)`** (as the existing build does).
+- **Values are not all numeric:** some signals are **enum/text with a numeric code**, and GM wants the **actual string preserved** (no lossy double conversion). **Recommended pattern (per the Impulse EU team — see [`IMPULSE_SCALING_AND_DESIGN.md`](./IMPULSE_SCALING_AND_DESIGN.md) §6):** not a single string column, but **multiple typed value columns on `channels`** — `raw_value` (int), `scaled_value` (double), `string_value` (string) — plus a **`value_map`** selector saying which column holds each datapoint (`value_map` also on `channel_metrics` to set a channel's value type). **Verified in data** (`DATA_AND_BUILD_FINDINGS.md` §2): **93% of channels are numeric** (number-as-string → double), **7% are enum** (string label + `enumMap`→code), **0 free-form text**. The existing build currently types `value` as `double` and **drops enum labels** — decision open (§11), though likely a non-issue for the boost/EGR POC tests (numeric signals).
 - Files: compressed MF4, ~hundreds of MB to multiple GB; durations 10–30 s (test-track maneuvers) up to 4 h (road trips); never merged — each session is its own file.
 - A **"common experiment"** core signal set is in every file (valuable for fleet-level analysis even when the recording calibrator doesn't care about those signals).
 
@@ -43,7 +45,7 @@ Impulse needs three core tables + optional supporting tables (all derivable from
 - **`file_status`** — needed for **incremental processing** (detect files added since the last Impulse report run) and filtering.
 - **Optional:** unit conversion (per-channel, e.g. F→C) and channel aliasing (merge differently-named columns for the same sensor, e.g. `valve_1`/`valve_2`) — maps to the SPOT **Aliases** sheet. Finalize once we see real value against GM data.
 
-**Standardized timestamp field:** TBD against GM's real bronze (sample time vs. µs vs. resolution-ms) once array-explode is implemented.
+**Standardized timestamp field:** **resolved** — bronze `timeStamps` are **epoch seconds (double)**, shared across all channels in a group (`DATA_AND_BUILD_FINDINGS.md` §2). The existing build stores them as `bigint` `tstart`/`tend` (RLE).
 
 ## 5. Gold layer & where derived metrics live
 - **Gold = Impulse's output** (aggregated fact/dimension tables; Impulse's configurable prefix defaults to `gold`).
@@ -55,8 +57,9 @@ Impulse needs three core tables + optional supporting tables (all derivable from
 - **Decision-ownership:** per John Leach guidance, individual teams shouldn't build their own silver independently — central **CDP/platform ("Carrie's team")** should review/own. Looped in for visibility; invited to recurring Friday syncs. Final sign-off authority still open.
 
 ## 7. POC scope (decided)
-- **Program: `DK68`** — the **one** vehicle program currently loaded in Databricks (**~6–8 more programs to be onboarded** later, likely MY27-forward). A second related program may be added as data lands.
-- **Take ~10 indicative containers (good test drives) with ALL their channels** — not a channel subset — plus the **2–3 specific, known-stable tests** that run against them.
+- **Program: `DK68`** — the **one** vehicle program currently loaded in Databricks (**~6–8 more programs to be onboarded** later, likely MY27-forward).
+- **Client-selected 5 files** = **`container_id 6–10`** in the existing build (`DATA_AND_BUILD_FINDINGS.md` §3): odo 39552/39575/39591/39610/39643 (vehicle KDUWT1217), each 5,441 channels × 48 groups. ⚠️ all share one software build (`E42Aa262718250gb_quasi`) — no build-to-build trend within this set unless more builds are added.
+- **Take indicative containers with ALL their channels** — not a channel subset — plus the **known-stable tests** that run against them (the GM **boost + EGR** test suite = 7 tests; `DATA_AND_BUILD_FINDINGS.md` §5).
 - Build in a **dedicated test catalog/schema** (not production). Test workspace has read access to prod; clone catalog-to-catalog for write. **Impulse runs on serverless — no special networking.**
 - Rationale: same code, less data; prove the approach before a full historical ETL. More programs (~6–8 additional) onboard later, likely MY27-forward rather than backfilling all history.
 
@@ -77,11 +80,12 @@ Reconciliation status:
 ## 11. Open questions
 - Final sign-off authority for the Bronze → Silver Plus change (Tom vs. central CDP).
 - Will data engineering permit **reading from bronze** for the POC (the main political dependency)?
-- Correct standardized **timestamp field** in real bronze; how to represent **program-level grouping** as a container tag.
-- Final **silver-vs-gold placement** of GM's derived flags/metrics.
-- Confirm the **value-column set** (`raw_value`/`scaled_value`/`string_value` + `value_map`, per [`IMPULSE_SCALING_AND_DESIGN.md`](./IMPULSE_SCALING_AND_DESIGN.md) §6) with Thomas Bonford against GM's real bronze; the multi-group same-signal corner case.
-- Where **track/fleet/vehicle metadata** lives (appears absent from current silver — likely bronze).
-- Volume reconciliation; rollout plan for the ~6–8 additional programs; on-prem→Azure storage migration timeline.
+- **Enum value typing** — the existing build types `value` as `double` and **drops enum labels**; decide whether to preserve them (`DATA_AND_BUILD_FINDINGS.md` §4/§6). Likely non-blocking for the boost/EGR POC tests (numeric signals).
+- **Port the real work** — replace the demo gold (generic events/hists/calc-channels) with the **7 boost/EGR tests + SPOT Template-Plots rows**, scoped to `container_id 6–10`.
+- **SPOT 2D-hist mean-of-Z** extension (`ADCAP_POC_PROPOSAL.md` §4.4); **program-level grouping** as a container tag; final **silver-vs-gold placement** of derived flags.
+- **Make the GM tests runnable** — obtain the `tests/common/` package (`dtc_validation.py`, the common `*_validation` modules).
+- Rollout plan for the ~6–8 additional programs; on-prem→Azure storage migration timeline.
+- *Resolved by findings:* timestamp = **epoch-seconds doubles**; value kinds (**93% numeric / 7% enum / 0 text**); metadata lives in **`file_status`**; **group = sample-rate**; multi-group same-signal is **real** (handled via `(channel, group)` identity); volume (41.5 TB external Parquet vs. 13.7 GB 10-file Delta subset; 61 TB = compressed binary).
 
 ## 12. Adjacent opportunities (out of POC scope)
 Co-simulation (software root-cause); EV team (Crispin, John Mark); engine test bench/dyno (AVL — involved in Impulse's origin); a "virtual" 1D modeling team; longer-term anomaly-pattern mining. Brian also sees broader GM time-series potential (plant/manufacturing, GM Financial, Motorsports ~10 ms Class A).
